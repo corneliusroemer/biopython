@@ -32,8 +32,10 @@ http://www.ebi.ac.uk/imgt/hla/docs/manual.html
 
 import warnings
 from datetime import datetime, date as datetime_date
+from enum import Enum
 from string import ascii_letters
 from string import digits
+from typing import NamedTuple
 
 from Bio import BiopythonWarning
 from Bio import SeqFeature
@@ -50,6 +52,90 @@ from .Interfaces import SequenceWriter
 # Set containing all characters allowed in feature qualifier keys. See
 # https://www.insdc.org/submitting-standards/feature-table/#3.1
 _allowed_table_component_name_chars = set(ascii_letters + digits + "_-'*")
+
+
+class _MoleculeKind(Enum):
+    DNA = "DNA"
+    RNA = "RNA"
+
+
+class _InsdcMoleculeType(NamedTuple):
+    kind: _MoleculeKind
+    genbank_locus_value: str
+
+
+# Values from the INSDC Feature Table Definition, version 11.3 (October 2024):
+# https://ftp.ebi.ac.uk/pub/databases/embl/doc/FT_current.txt
+_INSDC_MOLECULE_TYPES = {
+    "genomic DNA": _InsdcMoleculeType(_MoleculeKind.DNA, "DNA"),
+    "genomic RNA": _InsdcMoleculeType(_MoleculeKind.RNA, "RNA"),
+    "mRNA": _InsdcMoleculeType(_MoleculeKind.RNA, "mRNA"),
+    "tRNA": _InsdcMoleculeType(_MoleculeKind.RNA, "tRNA"),
+    "rRNA": _InsdcMoleculeType(_MoleculeKind.RNA, "rRNA"),
+    "other RNA": _InsdcMoleculeType(_MoleculeKind.RNA, "RNA"),
+    "other DNA": _InsdcMoleculeType(_MoleculeKind.DNA, "DNA"),
+    "transcribed RNA": _InsdcMoleculeType(_MoleculeKind.RNA, "RNA"),
+    "viral cRNA": _InsdcMoleculeType(_MoleculeKind.RNA, "RNA"),
+    "unassigned DNA": _InsdcMoleculeType(_MoleculeKind.DNA, "DNA"),
+    "unassigned RNA": _InsdcMoleculeType(_MoleculeKind.RNA, "RNA"),
+}
+
+
+def _warn_nonstandard_molecule_type(mol_type):
+    warnings.warn(
+        f"Non-standard molecule type: {mol_type}. The valid values are based on "
+        "the INSDC Feature Table Definition, version 11.3 (October 2024): "
+        "https://ftp.ebi.ac.uk/pub/databases/embl/doc/FT_current.txt. If the list "
+        "has changed, please report it at https://github.com/biopython/biopython/issues.",
+        BiopythonWarning,
+    )
+
+
+def _get_molecule_kind(mol_type):
+    """Return the molecule kind, retaining legacy handling of unknown values."""
+    try:
+        return _INSDC_MOLECULE_TYPES[mol_type].kind
+    except KeyError:
+        mol_type_upper = mol_type.upper()
+        if "DNA" in mol_type_upper:
+            return _MoleculeKind.DNA
+        if "RNA" in mol_type_upper:
+            return _MoleculeKind.RNA
+        if "PROTEIN" in mol_type_upper:
+            return None
+        raise ValueError(f"failed to understand molecule_type '{mol_type}'")
+
+
+def _get_genbank_molecule_type(mol_type):
+    """Map INSDC molecule types to the GenBank LOCUS vocabulary."""
+    try:
+        return _INSDC_MOLECULE_TYPES[mol_type].genbank_locus_value
+    except KeyError:
+        if mol_type in ("protein", "PROTEIN"):
+            return ""
+        if mol_type and len(mol_type) > 7:
+            mol_type = mol_type.replace("unassigned ", "").replace("genomic ", "")
+            if len(mol_type) > 7:
+                warnings.warn(f"Molecule type {mol_type!r} too long", BiopythonWarning)
+                return "DNA"
+        return mol_type
+
+
+def _validate_source_molecule_types(record, mol_type):
+    """Warn when a source feature /mol_type differs from the EMBL ID value."""
+    for feature in record.features:
+        if feature.type != "source":
+            continue
+        source_mol_types = feature.qualifiers.get("mol_type", [])
+        if not isinstance(source_mol_types, (list, tuple)):
+            source_mol_types = [source_mol_types]
+        if source_mol_types and mol_type not in source_mol_types:
+            warnings.warn(
+                f"Record molecule type {mol_type!r} does not match /mol_type "
+                f"{source_mol_types!r} on a source feature.",
+                BiopythonWarning,
+            )
+
 
 # NOTE
 # ====
@@ -800,14 +886,7 @@ class GenBankWriter(_InsdcWriter):
         mol_type = self._get_annotation_str(record, "molecule_type", None)
         if mol_type is None:
             raise ValueError("missing molecule_type in annotations")
-        if mol_type and len(mol_type) > 7:
-            # Deal with common cases from EMBL to GenBank
-            mol_type = mol_type.replace("unassigned ", "").replace("genomic ", "")
-            if len(mol_type) > 7:
-                warnings.warn(f"Molecule type {mol_type!r} too long", BiopythonWarning)
-                mol_type = "DNA"
-        if mol_type in ["protein", "PROTEIN"]:
-            mol_type = ""
+        mol_type = _get_genbank_molecule_type(mol_type)
 
         if mol_type == "":
             units = "aa"
@@ -1210,7 +1289,10 @@ class EmblWriter(_InsdcWriter):
         seq_len = len(data)
 
         molecule_type = record.annotations.get("molecule_type")
-        if molecule_type is not None and "DNA" in molecule_type:
+        if (
+            molecule_type is not None
+            and _get_molecule_kind(molecule_type) is _MoleculeKind.DNA
+        ):
             # TODO - What if we have RNA?
             a_count = data.count("A") + data.count("a")
             c_count = data.count("C") + data.count("c")
@@ -1291,40 +1373,15 @@ class EmblWriter(_InsdcWriter):
         mol_type = record.annotations.get("molecule_type")
         if mol_type is None:
             raise ValueError("missing molecule_type in annotations")
-        # Valid /mol_type values are defined by the INSDC Feature Table Definition,
-        # version 11.3 (October 2024):
-        # https://ftp.ebi.ac.uk/pub/databases/embl/doc/FT_current.txt
-        if mol_type not in (
-            "genomic DNA",
-            "genomic RNA",
-            "unassigned DNA",
-            "unassigned RNA",
-            "mRNA",
-            "tRNA",
-            "rRNA",
-            "other RNA",
-            "other DNA",
-            "transcribed RNA",
-            "viral cRNA",
-        ):
-            warnings.warn(
-                f"Non-standard molecule type: {mol_type}. The valid values are based "
-                "on the INSDC Feature Table Definition, version 11.3 (October 2024): "
-                "https://ftp.ebi.ac.uk/pub/databases/embl/doc/FT_current.txt. If the "
-                "list has changed, please report it at "
-                "https://github.com/biopython/biopython/issues.",
-                BiopythonWarning,
-            )
-        mol_type_upper = mol_type.upper()
-        if "DNA" in mol_type_upper:
+        if mol_type not in _INSDC_MOLECULE_TYPES:
+            _warn_nonstandard_molecule_type(mol_type)
+        _validate_source_molecule_types(record, mol_type)
+        kind = _get_molecule_kind(mol_type)
+        if kind in (_MoleculeKind.DNA, _MoleculeKind.RNA):
             units = "BP"
-        elif "RNA" in mol_type_upper:
-            units = "BP"
-        elif "PROTEIN" in mol_type_upper:
+        else:
             mol_type = "PROTEIN"
             units = "AA"
-        else:
-            raise ValueError(f"failed to understand molecule_type '{mol_type}'")
 
         # Get the taxonomy division
         division = self._get_data_division(record)

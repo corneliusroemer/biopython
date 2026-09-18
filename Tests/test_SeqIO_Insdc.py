@@ -62,6 +62,63 @@ class TestEmbl(unittest.TestCase):
         # The ID line has the topology as unspecified:
         self.assertNotIn("topology", record.annotations)
 
+    def test_embl_molecule_types(self):
+        valid = (
+            "genomic DNA",
+            "genomic RNA",
+            "mRNA",
+            "tRNA",
+            "rRNA",
+            "other RNA",
+            "other DNA",
+            "transcribed RNA",
+            "viral cRNA",
+            "unassigned DNA",
+            "unassigned RNA",
+        )
+        for molecule_type in valid:
+            record = SeqRecord(Seq("A"), "test")
+            record.annotations["molecule_type"] = molecule_type
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", BiopythonWarning)
+                self.assertIn(f"; {molecule_type};", record.format("embl"))
+        for molecule_type in ("DNA", "RNA", "protein"):
+            record = SeqRecord(Seq("A"), "test")
+            record.annotations["molecule_type"] = molecule_type
+            with self.assertWarnsRegex(BiopythonWarning, "Non-standard molecule type"):
+                record.format("embl")
+
+    def test_embl_molecule_type_must_match_source(self):
+        source = SeqFeature(
+            SimpleLocation(0, 1),
+            type="source",
+            qualifiers={"mol_type": ["genomic RNA"]},
+        )
+        record = SeqRecord(Seq("A"), "test", features=[source])
+        record.annotations["molecule_type"] = "genomic DNA"
+        with self.assertWarnsRegex(BiopythonWarning, "does not match /mol_type"):
+            record.format("embl")
+
+    def test_genbank_molecule_type_conversion(self):
+        expected = {
+            "genomic DNA": "DNA",
+            "genomic RNA": "RNA",
+            "mRNA": "mRNA",
+            "tRNA": "tRNA",
+            "rRNA": "rRNA",
+            "other DNA": "DNA",
+            "other RNA": "RNA",
+            "transcribed RNA": "RNA",
+            "viral cRNA": "RNA",
+            "unassigned DNA": "DNA",
+            "unassigned RNA": "RNA",
+        }
+        for molecule_type, locus_molecule_type in expected.items():
+            record = SeqRecord(Seq("A"), "test")
+            record.annotations["molecule_type"] = molecule_type
+            locus = record.format("gb").splitlines()[0].split()
+            self.assertEqual(locus_molecule_type, locus[4])
+
     def test_writing_empty_qualifiers(self):
         f = SeqFeature(
             SimpleLocation(5, 20, strand=+1),
